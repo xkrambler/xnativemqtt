@@ -1,9 +1,3 @@
-# xNativeMQTT
-**xnativemqqtt** is a simple Native PHP class to connect/publish/subscribe to an MQTT broker. Its a fork of [phpMQTT](https://github.com/bluerhinos/phpMQTT) project by Andrew Milsted (Blue Rhinos Consulting), thanks!
-
-## Publisher/Subscriber example
-
-```
 <?php
 
 	require_once("xnativemqtt.php");
@@ -40,5 +34,3 @@
 
 	// finish
 	$mqtt->close();
-```
-
