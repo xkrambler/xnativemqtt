@@ -2,9 +2,9 @@
 
 /*
 
- 	xNativeMQTT
+	xNativeMQTT
 	A simple native PHP class to connect/publish/subscribe to an MQTT broker.
-	By mr.xkr at inertinc industries
+	By mr.xkr at inertinc industries.
 	Based on phpMQTT class by Blue Rhinos Consulting | Andrew Milsted
 	         andrew@bluerhinos.co.uk | http://www.bluerhinos.co.uk
 
@@ -32,59 +32,73 @@
 
 class xNativeMQTT {
 
-	protected $o;           // options
-	private $socket;        // holds the socket
-	private $msgid=1;       // counter for message id
-	public $keepalive=10;   // default keepalive timmer
-	public $timeout=3;      // timeout (keepalive+timeout)
-	public $timesinceping;  // microtime, used to detect disconects
-	public $topics=array(); // used to store currently subscribed topics
-	public $debug=false;    // should output debug messages
-	public $host;           // broker address
-	public $port;           // broker port
-	public $clientid;       // client id sent to brocker
-	public $will;           // stores the will of the client
-	public $cafile;         // Certificate Authority file
+	const VERSION="0.1.2";
+	public $topics=array();    // used to store currently subscribed topics
+	public $will=false;        // stores the will of the client
+	public $connected=false;   // check connection status
+	protected $o;              // options
+	protected $defaults=array( // default options
+		"host"=>"127.0.0.1",     // broker address
+		"port"=>1883,            // broker port
+		"cafile"=>null,          // Certificate Authority file
+		"keepalive"=>10,         // keepalive interval
+		"timeout"=>3,            // timeout for connect/disconnect/reconnect
+		"qos"=>0,                // QoS
+		"waiting"=>20000,        // 20ms sleeping for looping
+	);
+	private $socket;           // holds the socket
+	private $msgid=1;          // counter for message id
+	private $timesinceping;    // microtime, used to detect disconects
 
+	// constructor
 	function __construct($o=array()) {
 		$this->setup($o);
 	}
 
-	// setup options
-	function setup($o=array()) {
-		$this->o=$o;
-		$this->host=($o["host"]?$o["host"]:"127.0.0.1");
-		$this->port=($o["port"]?$o["port"]:1883);
-		$this->clientid=($o["clientid"]?$o["clientid"]:"c".microtime(true));
-		$this->cafile=($o["cafile"]?$o["cafile"]:NULL);
+	// destructor
+	function __destruct() {
+		$this->disconnect();
+		$this->close();
 	}
 
-	// automatic reconnection
-	function reconnect($clean=false, $will=NULL) {
-		while (!$this->connect($clean, $will))
-			sleep($this->timeout);
-		return true;
+	// get/set/isset setup configuration
+	function __get($n) { return $this->o[$n]; }
+	function __set($n, $v) { $this->o[$n]=$v; }
+	function __isset($n) { return isset($this->o[$n]); }
+
+	// setup options
+	function setup($o=array()) {
+		if (!$o["clientid"]) $o["clientid"]="c".microtime(true); // generate
+		$this->o=$o+$this->defaults;
+	}
+
+	// debug rendering
+	function debug($msg) {
+		if ($d=$this->o["debug"]) {
+			if (is_callable($d)) $d($msg);
+			else error_log($msg."\n");
+		}
 	}
 
 	// connects to the broker inputs: $clean: should the client send a clean session flag
-	function connect($clean=true, $will=NULL) {
+	function connect($clean=true, $will=null) {
 
 		if ($will) $this->will=$will;
 
 		if ($this->cafile) {
-			$socketContext=stream_context_create([
+			$socket_context=stream_context_create([
 				"ssl"=>[
 					"verify_peer_name"=>true,
 					"cafile"=>$this->cafile,
 				],
 			]);
-			$this->socket=stream_socket_client("tls://".$this->host.":".$this->port, $errno, $errstr, 60, STREAM_CLIENT_CONNECT, $socketContext);
+			$this->socket=stream_socket_client("tls://".$this->host.":".$this->port, $errno, $errstr, 60, STREAM_CLIENT_CONNECT, $socket_context);
 		} else {
 			$this->socket=stream_socket_client("tcp://".$this->host.":".$this->port, $errno, $errstr, 60, STREAM_CLIENT_CONNECT);
 		}
 
-		if (!$this->socket) {
-			if ($this->debug) error_log("stream_socket_create() $errno, $errstr \n");
+	if (!$this->socket) {
+			$this->debug("stream_socket_create() $errno, $errstr");
 			return false;
 		}
 
@@ -110,13 +124,13 @@ class xNativeMQTT {
 
 		// add will info to header
 		if ($this->will != NULL) {
-			$var+=4;                            // set will flag
-			$var+=($this->will['qos'] << 3);    // set will qos
+			$var+=4;                             // set will flag
+			$var+=($this->will['qos'] << 3);     // set will qos
 			if ($this->will['retain']) $var+=32; // set will retain
 		}
 
-		if (isset($this->o["user"])) $var+=128; // add username to header
-		if (isset($this->o["pass"])) $var+=64;	 // add password to header
+		if (isset($this->user)) $var+=128; // add username to header
+		if (isset($this->pass)) $var+=64;  // add password to header
 
 		$buffer.=chr($var); $i++;
 
@@ -134,24 +148,44 @@ class xNativeMQTT {
 		}
 
 		// add user/pass
-		if (isset($this->o["user"])) $buffer.=$this->strwritestring($this->o["user"], $i);
-		if (isset($this->o["pass"])) $buffer.=$this->strwritestring($this->o["pass"], $i);
+		if (isset($this->user)) $buffer.=$this->strwritestring($this->user, $i);
+		if (isset($this->pass)) $buffer.=$this->strwritestring($this->pass, $i);
 
+		// send header+buffer
 		$head=chr(0x10).chr($i);
-		fwrite($this->socket, $head);
-		fwrite($this->socket, $buffer);
+		$this->send($head.$buffer);
 
+	 	// check connection
 	 	$res=$this->read(4);
-
-		if (ord($res{0})>>4 == 2 && $res{3} == 0) {
-			if ($this->debug) echo "Connected to Broker\n"; 
+		if ($this->connected=(ord($res{0})>>4 == 2 && $res{3} == 0)) {
+			$this->debug("Connected to Broker"); 
 		} else {
-			error_log(sprintf("Connection failed! (Error: 0x%02x 0x%02x)\n", ord($res{0}), ord($res{3})));
+			$this->debug(sprintf("Connection failed! (Error: 0x%02x 0x%02x)", ord($res{0}), ord($res{3})));
 			return false;
 		}
 
 		$this->timesinceping=microtime(true);
 
+		return true;
+	}
+
+	// disconnect: sends a proper disconect cmd, if needed
+	function disconnect() {
+		if ($this->connected) {
+			$head=chr(0xe0).chr(0x00);
+			$this->send($head);
+			$this->connected=false;
+			return true;
+		}
+		return false;
+	}
+
+	// automatic reconnection
+	function reconnect($clean=false, $will=null) {
+		if ($this->connected) $this->close();
+		while (!$this->connect($clean, $will))
+			sleep($this->timeout);
+		if ($this->topics) $this->subscribe($this->topics);
 		return true;
 	}
 
@@ -177,34 +211,39 @@ class xNativeMQTT {
 
 	}
 
-	// ping: sends a keep alive ping
-	function ping() {
-		$head=chr(0xc0).chr(0x00);
-		fwrite($this->socket, $head);
-		if ($this->debug) echo "ping sent\n";
+	// send binary data
+	function send($data, $len=null) {
+		return fwrite($this->socket, $data, ($len === null?strlen($data):$len));
 	}
 
-	// disconnect: sends a proper disconect cmd
-	function disconnect() {
-		$head=chr(0xe0).chr(0x00);
-		fwrite($this->socket, $head);
+	// ping: sends a keep alive ping
+	function ping() {
+		if ($this->connected) {
+			$this->send(chr(0xc0).chr(0x00));
+			$this->debug("ping sent");
+		}
+		return $this->connected;
 	}
 
 	// close: sends a proper disconect, then closes the socket
 	function close() {
-	 	$this->disconnect();
-		stream_socket_shutdown($this->socket, STREAM_SHUT_WR);
+	 	$this->connected=false;
+		@stream_socket_shutdown($this->socket, STREAM_SHUT_WR);
+		return @fclose($this->socket);
 	}
 
 	// publish: publishes $content on a $topic
-	function publish($topic, $content, $qos=0, $retain=0) {
+	function publish($topic, $content, $qos=null, $retain=0) {
+
+		if ($qos !== null) $this->qos=intval($qos);
+		if (!is_numeric($this->qos)) return false;
 
 		$i=0;
 		$buffer="";
 
-		$buffer.=$this->strwritestring($topic,$i);
+		$buffer.=$this->strwritestring($topic, $i);
 
-		if ($qos) {
+		if ($this->qos) {
 			$id=$this->msgid++;
 			$buffer.=chr($id >> 8);  $i++;
 		 	$buffer.=chr($id % 256);  $i++;
@@ -214,18 +253,22 @@ class xNativeMQTT {
 		$i+=strlen($content);
 
 		$cmd=0x30;
-		if ($qos) $cmd+=$qos << 1;
+		if ($this->qos) $cmd+=$this->qos << 1;
 		if ($retain) $cmd+=1;
 
 		$head=chr($cmd).$this->setmsglength($i);
 
-		fwrite($this->socket, $head, strlen($head));
-		fwrite($this->socket, $buffer, $i);
+		$this->send($head);
+		$this->send($buffer, $i);
 
 	}
 
-	// subscribe: subscribes to topics
-	function subscribe($topics, $qos=0) {
+	// subscribe: subscribes to one or more topics defined in array
+	// 	each topic sintax: array("topic"=>"string", "function"=>function($topic, $msg){})
+	function subscribe($topics, $qos=null) {
+
+		if ($qos !== null) $this->qos=intval($qos);
+		if (!is_numeric($this->qos)) return false;
 
 		$i=0;
 		$buffer="";
@@ -234,18 +277,18 @@ class xNativeMQTT {
 		$buffer.=chr($id % 256); $i++;
 
 		foreach ($topics as $key => $topic) {
-			$buffer.=$this->strwritestring($key,$i);
+			$buffer.=$this->strwritestring($key, $i);
 			$buffer.=chr($topic["qos"]); $i++;
 			$this->topics[$key]=$topic; 
 		}
 
 		$cmd=0x80;
-		$cmd+=($qos << 1); // $qos
+		$cmd+=($this->qos << 1); // $qos
 
 		$head=chr($cmd).chr($i);
 
-		fwrite($this->socket, $head);
-		fwrite($this->socket, $buffer, $i);
+		$this->send($head);
+		$this->send($buffer, $i);
 		$string=$this->read(2);
 		
 		$bytes=ord(substr($string, 1, 1));
@@ -271,7 +314,7 @@ class xNativeMQTT {
 				}
 			}
 		}
-		if ($this->debug && !$found) echo "msg received but no match in subscriptions\n";
+		if (!$found) $this->debug("msg received but no match in subscriptions");
 	}
 
 	// proc: the processing loop for an "always on" client
@@ -283,17 +326,15 @@ class xNativeMQTT {
 			$cmd=0;
 
 			if (feof($this->socket)) {
-				if ($this->debug) echo "eof receive going to reconnect for good measure\n";
-				fclose($this->socket);
+				$this->debug("eof receive going to reconnect for good measure");
 				$this->reconnect();
-				if (count($this->topics)) $this->subscribe($this->topics);	
 			}
 
 			$byte=$this->read(1, true);
 			if (strlen($byte)) {
-			
+
 				$cmd=(int)(ord($byte) / 16);
-				if ($this->debug) echo "Received: $cmd\n";
+				$this->debug("Received: $cmd");
 
 				$multiplier=1;
 				$value=0;
@@ -305,7 +346,7 @@ class xNativeMQTT {
 
 				$string=false;
 				if ($value) {
-					if ($this->debug) echo "Fetching: $value\n";
+					$this->debug("Fetching: $value");
 					$string=$this->read($value);
 				}
 
@@ -318,20 +359,18 @@ class xNativeMQTT {
 
 			} else {
 
-				if ($loop) usleep(20000);
+				if ($loop && $this->waiting > 0) usleep($this->waiting);
 
 			}
 
 			if ($this->timesinceping < (microtime(true) - $this->keepalive)) {
-				if ($this->debug) echo "not found something so ping\n";
+				$this->debug("not found something so ping");
 				$this->ping();	
 			}
 
 			if ($this->timesinceping < (microtime(true) - ($this->keepalive + $this->timeout))) {
-				if ($this->debug) echo "not seen a package in a while, disconnecting\n";
-				fclose($this->socket);
+				$this->debug("not seen a package in a while, disconnecting");
 				$this->reconnect();
-				if (count($this->topics)) $this->subscribe($this->topics);
 			}
 
 		} while (strlen($byte));
